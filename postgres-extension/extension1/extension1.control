@@ -1,0 +1,4 @@
+# extension1 extension
+comment = 'extension loading test'
+default_version = '0.1'
+relocatable = true

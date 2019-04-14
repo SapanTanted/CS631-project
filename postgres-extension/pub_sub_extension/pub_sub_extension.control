@@ -1,0 +1,4 @@
+# pub_sub_extension extension
+comment = 'pub sub streaming test'
+default_version = '0.1'
+relocatable = true
