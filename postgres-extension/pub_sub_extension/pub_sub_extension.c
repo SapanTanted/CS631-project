@@ -49,11 +49,13 @@ void logInfo(char* key,char* value);
 bool is_client_id_registered(char * client_id);
 bool get_topic_id_and_relative_timeout(char* topic, int* topic_id, int64* relative_timeout); 
 bool insert_payload_entry(char* client_id, int topic_id, char* payload, pg_time_t payload_timestamp, pg_time_t expiry_timestamp);
+void subscribe_wait(int topic_id, pg_time_t wait_start_timestamp);
+Datum fetch_all_payloads_till(FunctionCallInfo fcinfo, char* topic, int topic_id,pg_time_t from,pg_time_t till);
 
 static int maxSems = 1000;
 static sem_t * mySemPointers[1000];//= (sem_t **) palloc(1000* sizeof(sem_t *));;	/* keep track of created semaphores */
 static int number_of_subscriptions[1000];
-	
+
 PG_FUNCTION_INFO_V1(connect_stream);
 Datum
 connect_stream(PG_FUNCTION_ARGS)
@@ -113,10 +115,10 @@ publish(PG_FUNCTION_ARGS)
 	if(insert_payload_entry(client_id,*topic_id,payload,payload_timestamp,expiry_timestamp)){
 		//alert all subscribers
 		logInfo("Alert","All subscribers");
-		sem_t *semaphore = mySemPointers[*topic_id];
-		for(int i=0;i<number_of_subscriptions[*topic_id];i++){
-			PGSemaphoreUnlock(semaphore);
-		}
+		// sem_t *semaphore = mySemPointers[*topic_id];
+		// for(int i=0;i<number_of_subscriptions[*topic_id];i++){
+		// 	PGSemaphoreUnlock(semaphore);
+		// }
 	}else{
 		SPI_finish();
 		PG_RETURN_TEXT_P(cstring_to_text("Could not insert payload entry!"));	
@@ -125,17 +127,50 @@ publish(PG_FUNCTION_ARGS)
 	SPI_finish();
     PG_RETURN_TEXT_P(cstring_to_text("Published!!"));
 }
-int abc = 1;
-//USE_NAMED_POSIX_SEMAPHORES is not defined
 
 PG_FUNCTION_INFO_V1(subscribe);
 Datum
 subscribe(PG_FUNCTION_ARGS)
 {
-	elog(INFO,"subscribe : %d",abc);
+	FuncCallContext *funcctx;
+	AttInMetadata *attinmeta;
+	MemoryContext oldcontext;
+	bool abort = false;
+	/* stuff done only on the first call of the function */
+	if (SRF_IS_FIRSTCALL())
+	{
+		Relation	rel;
+		TupleDesc	tupdesc;
+		/* create a function context for cross-call persistence */
+		funcctx = SRF_FIRSTCALL_INIT();
+		/*
+		 * switch to memory context appropriate for multiple function calls
+		 */
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		/*
+		 * need a tuple descriptor representing one INT and one TEXT column
+		 */
+		 //schema(topic text, payload_timestamp timestamp, payload text);
+		tupdesc = CreateTemplateTupleDesc(3);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "topic",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "payload_timestamp",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "payload",
+						   TEXTOID, -1, 0);
+
+		/*
+		 * Generate attribute metadata needed later to produce tuples from raw
+		 * C strings
+		 */
+		attinmeta = TupleDescGetAttInMetadata(tupdesc);
+		funcctx->attinmeta = attinmeta;
+		MemoryContextSwitchTo(oldcontext);
+	}
+
 	char *client_id = text_to_cstring(PG_GETARG_TEXT_PP(0));
-    char *topic = text_to_cstring(PG_GETARG_TEXT_PP(1));
-    int timeout = atoi(text_to_cstring(PG_GETARG_TEXT_PP(2)));
+	char *topic = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	int timeout = atoi(text_to_cstring(PG_GETARG_TEXT_PP(2)));
 	//check if subscription entry exists if not then add
 	//check if timeout happened or not
 	//
@@ -147,20 +182,20 @@ subscribe(PG_FUNCTION_ARGS)
 		SPI_finish();
 		PG_RETURN_TEXT_P(cstring_to_text("client_id not registered!"));	
 	}
-	PGReserveSemaphores(1000,2000);
-	logInfo("Initializing","Semaphore");
-	mySemPointers[1]= PGSemaphoreCreate();
-	logInfo("Reseting","Semaphore");
-	PGSemaphoreReset(mySemPointers[1]);
-	logInfo("Locking","Semaphore");
-	number_of_subscriptions[1]++;
-	PGSemaphoreLock(mySemPointers[1]);
-	logInfo("After","Semaphore");
+	// PGReserveSemaphores(1000,2000);
+	// logInfo("Initializing","Semaphore");
+	// mySemPointers[1]= PGSemaphoreCreate();
+	// logInfo("Reseting","Semaphore");
+	// PGSemaphoreReset(mySemPointers[1]);
+	// logInfo("Locking","Semaphore");
+	// number_of_subscriptions[1]++;
+	// PGSemaphoreLock(mySemPointers[1]);
+	// logInfo("After","Semaphore");
 
+	//add entry in topic table if not exists
 	//check if subscription entry exists if not then add
-
 	//if subscription entry exists then
-	//set is_connected = true;
+	// set is_connected = true;
 	//check if last_ping_timestamp+timeout is less than current_timestamp i.e. timed out already
 	//if timed out then set last_ping_timestamp to current_timestamp and wait on semaphore
 	//if not timed out then fetch all payloads from last_ping_timestamp till current_timestamp and set last_ping_timestamp to current_timestamp
@@ -170,18 +205,304 @@ subscribe(PG_FUNCTION_ARGS)
 	//add subscription entry and wait on semaphore
 	//set is_connected = true
 
-	//add entry in topic table
 	//initialize mySemPointers for that topic_id
 	//increment number_of_subscription for that topic_id
-	EndTransactionBlock(true);
-
-	//set is_connected = false;
+	
+	int64 *relative_timeout=(int64*) palloc(sizeof(int64));
+	int *topic_id=(int*) palloc(sizeof(int));
+	if(!get_topic_id_and_relative_timeout(topic,topic_id,relative_timeout)){
+		//topic not found ---- adding a new topic in topic_table
+		char* t_query = "insert into topic_table (topic_id,topic,last_msg_recv_timestamp,relative_timeout) values(NULL,'%s',CURRENT_TIMESTAMP,0) "; // temporary query variable
+		char* query=palloc(sizeof(char)*(strlen(t_query)+strlen(topic)));
+		sprintf(query,t_query,topic);
+		logInfo("[subscribe]Executing Query",query);
+		PG_TRY();
+		{
+			if(SPI_execute(text_to_cstring(cstring_to_text(query)),false, 0)==SPI_OK_INSERT){
+				if(!get_topic_id_and_relative_timeout(topic,topic_id,relative_timeout)){
+					abort=true;
+					SPI_finish();
+					SRF_RETURN_DONE(funcctx);
+				}
+			}else{
+				abort=true;
+			}
+		}
+		PG_CATCH();
+		{ //TODO catch exceptions for duplicate key and send proper error message
+			logInfo("Exception in query",query);
+		}
+		PG_END_TRY();
+	}
+	char* t_query = "select * from subscription_table where client_id = '%s' and topic_id = '%d'"; // temporary query 
+	char* query=palloc(sizeof(char)*(strlen(t_query)+strlen(client_id))+sizeof(int));
+	sprintf(query,t_query,client_id,*topic_id);
+	logInfo("[subscribe]Executing query",query);
+	PG_TRY();
+	{
+		if(SPI_execute(text_to_cstring(cstring_to_text(query)),true, 0)==SPI_OK_SELECT){
+			if(SPI_processed <= 0){
+			//subscription entry not exists
+			//adding subscription entry and changing relative_timeout in topic_table;
+				char* t_query = "insert into subscription_table (client_id, topic_id,subscription_timestamp,timeout,last_ping_timestamp) values('%s','%d',CURRENT_TIMESTAMP,'%d', CURRENT_TIMESTAMP) "; // temporary query variable
+				char* query=palloc(sizeof(char)*(strlen(t_query)+strlen(client_id))+2*sizeof(int));
+				sprintf(query,t_query,client_id,topic_id,timeout);
+				logInfo("[subscribe]Executing Query",query);
+				PG_TRY();
+				{
+					if(SPI_execute(text_to_cstring(cstring_to_text(query)),false, 0)==SPI_OK_INSERT){
+						char* t_query = "select max(extract(epoch from last_ping_timestamp) + timeout - extract(epoch from CURRENT_TIMESTAMP)) as max_relative_timeout from subscription_table where topic_id='%d'"; // temporary query 
+						char* query=palloc(sizeof(char)*(strlen(t_query))+sizeof(int));
+						sprintf(query,t_query,*topic_id);
+						logInfo("[subscribe]Executing query",query);
+						PG_TRY();
+						{
+							if(SPI_execute(text_to_cstring(cstring_to_text(query)),true, 0)==SPI_OK_SELECT)
+							{
+								SPITupleTable *spi_tuptable = SPI_tuptable;
+								TupleDesc	spi_tupdesc = spi_tuptable->tupdesc;
+								int64 proc = SPI_processed;
+								int new_relative_timeout = 0;
+								for (int64 i = 0; i < proc; i++)
+								{	/* get the next sql result tuple */
+									HeapTuple spi_tuple = spi_tuptable->vals[i];
+									new_relative_timeout = atoi(SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc,"max_relative_timeout")));
+								}
+								if(*relative_timeout < new_relative_timeout){
+									char* t_query = "update topic_table set relative_timeout='%d' where topic_id='%d'"; // temporary query variable
+									char* query=palloc(sizeof(char)*(strlen(t_query))+sizeof(topic_id)+sizeof(new_relative_timeout));
+									sprintf(query,t_query,new_relative_timeout,topic_id);
+									logInfo("[subscribe]Executing query",query);
+									PG_TRY();
+									{
+										if(SPI_execute(text_to_cstring(cstring_to_text(query)),false, 0)==SPI_OK_UPDATE){	
+										}
+									}
+									PG_CATCH();
+									{ //TODO catch exceptions
+										logInfo("Exception in query",query);
+									}
+									PG_END_TRY();
+								}
+								logInfo("Relative timeout",psprintf("%d",new_relative_timeout));
+							}
+						}
+						PG_CATCH();
+						{ //TODO catch exceptions for duplicate key and send proper error message
+							logInfo("Exception in query",query);
+						}
+						PG_END_TRY();
+					}else{
+						abort=true;
+					}
+				}
+				PG_CATCH();
+				{ //TODO catch exceptions for duplicate key and send proper error message
+					logInfo("Exception in query",query);
+				}
+				PG_END_TRY();
+			}
+			//now subscription entry exists
+			pg_time_t  current_timestamp = timestamptz_to_time_t(GetCurrentTimestamp());
+			int64 subscriber_last_ping_timestamp, subscriber_timeout;
+			SPITupleTable *spi_tuptable = SPI_tuptable;
+			TupleDesc	spi_tupdesc = spi_tuptable->tupdesc;
+			int64 proc = SPI_processed;
+			for (int64 i = 0; i < proc; i++)
+			{
+				/* get the next sql result tuple */
+				HeapTuple spi_tuple = spi_tuptable->vals[i];
+				subscriber_timeout = atoi(SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc,"timeout")));
+				subscriber_last_ping_timestamp = atoi(SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc,"last_ping_timestamp")));
+			}
+			if(subscriber_last_ping_timestamp+subscriber_timeout < current_timestamp){
+				//timed out already
+				//set last_ping_timestamp to current_timestamp and wait 
+			}else{
+				//fetch all payloads from last_ping_timestamp till current_timestamp and add to result
+				fetch_all_payloads_till(fcinfo,topic, *topic_id,subscriber_last_ping_timestamp,current_timestamp);
+				//set last_ping_timestamp to current_timestamp
+			}
+			char* t_query = "update subscription_table set last_ping_timestamp = to_timestamp('%ld')"; // temporary query 
+			char* query=palloc(sizeof(char)*(strlen(t_query))+sizeof(current_timestamp));
+			sprintf(query,t_query,current_timestamp);
+			logInfo("[subscribe]Executing query",query);
+			PG_TRY();
+			{
+				//set last_ping_timestamp to current_timestamp and wait 
+				if(SPI_execute(text_to_cstring(cstring_to_text(query)),false, 0) == SPI_OK_UPDATE)
+				{
+					pg_time_t last_ping_timestamp = current_timestamp;
+					// subscribe_wait(*topic_id,last_ping_timestamp);
+					pg_time_t  current_timestamp = timestamptz_to_time_t(GetCurrentTimestamp());
+					// fetch_all_payloads_till(fcinfo,topic,*topic_id,last_ping_timestamp,current_timestamp);
+					char* t_query = "update subscription_table set last_ping_timestamp = to_timestamp('%ld')"; // temporary query 
+					char* query=palloc(sizeof(char)*(strlen(t_query))+sizeof(current_timestamp));
+					sprintf(query,t_query,current_timestamp);
+					logInfo("[subscribe]Executing query",query);
+					PG_TRY();
+					{
+						//set last_ping_timestamp to current_timestamp and wait 
+						if(SPI_execute(text_to_cstring(cstring_to_text(query)),false, 0) == SPI_OK_UPDATE)
+						{
+							
+						}else{
+							abort = true;
+						}
+					}
+					PG_CATCH();
+					{ //TODO catch exceptions for duplicate key and send proper error message
+						logInfo("Exception in query",query);
+					}
+					PG_END_TRY();
+				}
+			}
+			PG_CATCH();
+			{ //TODO catch exceptions for duplicate key and send proper error message
+				logInfo("Exception in query",query);
+			}
+			PG_END_TRY();
+		}
+	}
+	PG_CATCH();
+	{ //TODO catch exceptions for duplicate key and send proper error message
+		logInfo("Exception in query",query);
+	}
+	PG_END_TRY();
+	if(abort){
+		logInfo("Something went wrong in subscribe function!","Aborting transaction!");
+		AbortCurrentTransaction();
+	}
 	EndTransactionBlock(false);
 	SPI_finish();
+	SRF_RETURN_DONE(funcctx);
+}
+void subscribe_wait(int topic_id, pg_time_t wait_start_timestamp){
+		while(1){	
+			//wait till last_msg_recv_timestamp is greater than wait_start_timestamp
+			char* t_query = "select * from topic_table where topic_id = '%d' and last_msg_recv_timestamp >= to_timestamp('%ld')"; // temporary query 
+			char* query=palloc(sizeof(char)*(strlen(t_query))+sizeof(int)+sizeof(wait_start_timestamp));
+			sprintf(query,t_query,topic_id,wait_start_timestamp);
+			logInfo("[subscribe_wait]Executing query",query);
+			PG_TRY();
+			{
+				if(SPI_execute(text_to_cstring(cstring_to_text(query)),true, 0)==SPI_OK_SELECT){
+					int rows = SPI_processed;
+					if( rows > 0){
+						logInfo("Rows found",psprintf("%d",rows));
+						SPITupleTable *spi_tuptable = SPI_tuptable;
+						TupleDesc	spi_tupdesc = spi_tuptable->tupdesc;
+						int64 proc = SPI_processed;
+						for (int64 i = 0; i < proc; i++)
+						{	/* get the next sql result tuple */
+							HeapTuple spi_tuple = spi_tuptable->vals[i];
+							char* last_msg_recv_timestamp = (SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc,"last_msg_recv_timestamp")));
+							logInfo("last_msg_recv_timestamp",last_msg_recv_timestamp);
+						}
+						break;
+					}else{
+						logInfo("Rows found",psprintf("%d",rows));
+					}
+				}
+			}
+			PG_CATCH();
+			{ //TODO catch exceptions for duplicate key and send proper error message
+				logInfo("Exception in query",query);
+			}
+			PG_END_TRY();
+			pg_usleep(0.5*1000000L);
+		}
 }
 
+Datum fetch_all_payloads_till(FunctionCallInfo fcinfo, char* topic, int topic_id,pg_time_t from,pg_time_t till){
+	
+	FuncCallContext *funcctx;
+	int32		call_cntr;
+	AttInMetadata *attinmeta;
+	MemoryContext oldcontext;
+/* stuff done only on the first call of the function */
+	// if (SRF_IS_FIRSTCALL())
+	// {
+	// 	Relation	rel;
+	// 	TupleDesc	tupdesc;
+	// 	/* create a function context for cross-call persistence */
+	// 	funcctx = SRF_FIRSTCALL_INIT();
+	// 	/*
+	// 	 * switch to memory context appropriate for multiple function calls
+	// 	 */
+	// 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+	// 	/*
+	// 	 * need a tuple descriptor representing one INT and one TEXT column
+	// 	 */
+	// 	 //schema(topic text, payload_timestamp timestamp, payload text);
+	// 	tupdesc = CreateTemplateTupleDesc(3);
+	// 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "topic",
+	// 					   TEXTOID, -1, 0);
+	// 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "payload_timestamp",
+	// 					   TEXTOID, -1, 0);
+	// 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "payload",
+	// 					   TEXTOID, -1, 0);
+
+	// 	/*
+	// 	 * Generate attribute metadata needed later to produce tuples from raw
+	// 	 * C strings
+	// 	 */
+	// 	attinmeta = TupleDescGetAttInMetadata(tupdesc);
+	// 	funcctx->attinmeta = attinmeta;
+	// 	MemoryContextSwitchTo(oldcontext);
+	// }
+
+	/* stuff done on every call of the function */
+	funcctx = SRF_PERCALL_SETUP();
+	//initialize per-call variables
+	call_cntr = funcctx->call_cntr;
+	// results = (char **) funcctx->user_fctx;
+	attinmeta = funcctx->attinmeta;
+
+	char* t_query = "select * from payload_table where payload_timestamp >= to_timestamp('%ld') and payload_timestamp < to_timestamp('%ld') and topic_id='%d'"; // temporary query 
+	char* query=palloc(sizeof(char)*(strlen(t_query))+sizeof(int) + 2* sizeof(pg_time_t));
+	sprintf(query,t_query,from,till,topic_id);
+	logInfo("[fetch_all_payloads_till]Executing query",query);
+	PG_TRY();
+	{
+		if(SPI_execute(text_to_cstring(cstring_to_text(query)),true, 0)==SPI_OK_SELECT)
+		{
+			//all records are here
+			SPITupleTable *spi_tuptable = SPI_tuptable;
+			TupleDesc	spi_tupdesc = spi_tuptable->tupdesc;
+			int64 proc = SPI_processed;
+			for (int64 i = 0; i < proc; i++)
+			{	/* get the next sql result tuple */
+				HeapTuple spi_tuple = spi_tuptable->vals[i];
+				char* payload_timestamp = (SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc,"payload_timestamp")));
+				char* payload = (SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc,"payload")));
+				//schema(topic text, payload_timestamp timestamp, payload text);
+				char  **values;
+				HeapTuple	tuple;
+				Datum		result;
+				values = (char **) palloc(2 * sizeof(char *));
+				values[0] = psprintf("%s", topic);
+				values[1] = psprintf("%s", payload_timestamp);
+				values[2] = psprintf("%s", payload);
+				/* build the tuple */
+				tuple = BuildTupleFromCStrings(attinmeta, values);
+				/* make the tuple into a datum */
+				result = HeapTupleGetDatum(tuple);
+				SRF_RETURN_NEXT(funcctx, result);
+			}
+		}
+	}
+	PG_CATCH();
+	{ //TODO catch exceptions for duplicate key and send proper error message
+		logInfo("Exception in query",query);
+	}
+	PG_END_TRY();
+	SRF_RETURN_DONE(funcctx);
+}
+
+
 bool insert_payload_entry(char* client_id, int topic_id, char* payload, pg_time_t payload_timestamp, pg_time_t expiry_timestamp){
-	StartTransactionCommand();
+	//StartTransactionCommand();
 	bool payload_added = false;
 	//insert payload with above details
 	//update topic table with payload_timestamp = last_msg_recv_timestamp
@@ -218,12 +539,12 @@ bool insert_payload_entry(char* client_id, int topic_id, char* payload, pg_time_
 		logInfo("Payload could not be added!","Aborting transaction!");
 		AbortCurrentTransaction();
 	}
-	CommitTransactionCommand();
+	//CommitTransactionCommand();
 	return payload_added;
 }
 
 bool get_topic_id_and_relative_timeout(char* topic, int *topic_id, int64 *relative_timeout){
-	StartTransactionCommand();
+	//StartTransactionCommand();
 	bool topic_found = false;
 	//insert ignore topic
 	// char* t_query = "insert ignore into topic_table (topic_id,topic,last_msg_recv_timestamp,relative_timeout) values(NULL,'%s',CURRENT_TIMESTAMP,0) "; // temporary query variable
@@ -259,11 +580,11 @@ bool get_topic_id_and_relative_timeout(char* topic, int *topic_id, int64 *relati
 		logInfo("Exception in query",query);
 	}
 	PG_END_TRY();
-	CommitTransactionCommand();
+	//CommitTransactionCommand();
 	return topic_found;
 }
 bool is_client_id_registered(char * client_id){
-	StartTransactionCommand();
+	//StartTransactionCommand();
 	bool registered = false;
 	char* t_query = "select count(*) as count from client_table where client_id='%s'"; // temporary query 
 	char* query=palloc(sizeof(char)*(strlen(t_query)+strlen(client_id)));
@@ -298,7 +619,7 @@ bool is_client_id_registered(char * client_id){
 		logInfo("Exception in query",query);
 	}
 	PG_END_TRY();
-	CommitTransactionCommand();
+	//CommitTransactionCommand();
 	return registered;
 }
 
