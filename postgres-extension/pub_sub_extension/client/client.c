@@ -3,6 +3,7 @@
 #include <libpq-fe.h>
 #include <pthread.h>
 #include <string.h>
+#include <unistd.h>
 
 void do_exit(PGconn *conn) {    
     PQfinish(conn);
@@ -20,22 +21,22 @@ void connect_stream(char *client_id){
 		//do_exit(conn);
 	}
 	sprintf(query,"select connect_stream('%s');",client_id);
-	printf("%s\n",query);
+	//printf("%s\n",query);
 	PGresult *res = PQexec(conn, query);
-	printf("%d\n\n",PQresultStatus(res));
+	//printf("%d\n\n",PQresultStatus(res));
 	if (PQresultStatus(res)!=PGRES_TUPLES_OK) {
         printf("stream conncection unsuccessful\n");        
         PQclear(res);
         do_exit(conn);
     }
-    printf("stream conncection successful\n");
+    //printf("stream conncection successful\n");
 }
 
 int publish(char *client_id, char *topic, char *payload){
 	char query[100];
 	sprintf(query,"select publish('%s', '%s', '%s')",client_id, topic, payload);
 	PGresult *res = PQexec(conn, query);
-	if(PQresultStatus(res)!=PGRES_COMMAND_OK){
+	if(PQresultStatus(res)!=PGRES_TUPLES_OK){
 		printf("publish didn't worked for %s.",client_id);
 		PQclear(res);
 	}
@@ -62,7 +63,8 @@ void mysubscribe(void *args){
 
 		rows = PQntuples(res);
 		for(i = 0; i<rows; i++)
-			(*args1->callbackfn)(PQgetvalue(res, i ,0 /* topic */), PQgetvalue(res, i ,1 /* payload timestamp*/), PQgetvalue(res, i ,2/* payload */));
+			(*args1->callbackfn)(PQgetvalue(res, i ,0 /* topic */));
+			/* Other arguments */ // PQgetvalue(res, i ,1 /* payload timestamp*/), PQgetvalue(res, i ,2/* payload */));
 		PQclear(res);
 	}		
 }
@@ -86,20 +88,40 @@ int subscribe(char *client_id, char *topic, int timeout, void (*callbackfn)()){
 
 		rows = PQntuples(res);
 		for(i = 0; i<rows; i++)
-			(*callbackfn)(PQgetvalue(res, i ,0 /* topic */), PQgetvalue(res, i ,1 /* payload timestamp*/), PQgetvalue(res, i ,2/* payload */));
+			(*callbackfn)(PQgetvalue(res, i ,0 /* topic */));
+			/* Other arguments*/ // PQgetvalue(res, i ,1 /* payload timestamp*/), PQgetvalue(res, i ,2/* payload */) */
 		PQclear(res);
 	}
 }
 
-void callback(char* topic, char* payload_timestamp, char* payload){
-	printf("%s %s %s\n", topic, payload_timestamp, payload);
+void callback(char* topic){
+	printf("%s\n", topic);
 }
 
-int main(){
-	connect_stream("client5");
-	//publish("client2", "topic1", "first message");
-	subscribe("client5", "topic1", 1000, callback);
+int main(int argc, char **argv){
+	char *client_id, *topic, *payload;
+	int timeout;
+	int ch;
+	client_id = (char*)malloc(sizeof(char)*100);
+	topic = (char*)malloc(sizeof(char)*100);
+	payload = (char*)malloc(sizeof(char)*100);
+	memset(client_id ,'\0', sizeof(client_id));
+	memset(topic ,'\0', sizeof(topic));
+	memset(payload ,'\0', sizeof(topic));
+
+	strcpy(client_id, argv[2]);
+	strcpy(topic, argv[3]);
+	connect_stream(client_id);
+	if(argv[1][0] == 'p') {
+		strcpy(payload, argv[4]);
+		publish(client_id, topic, payload);	
+	}
+	else{
+		timeout = atoi(argv[4]);
+		subscribe(client_id, topic, timeout, callback);
+	}
 	PQfinish(conn);
-	//while(1);
-
 }
+
+/* Command to execute: ./client <publish/subscribe> <client id> <topic> <payload/timeout> */
+

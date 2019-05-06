@@ -148,11 +148,11 @@ subscribe(PG_FUNCTION_ARGS)
 	//check if subscription entry exists if not then add
 	//check if timeout happened or not
 	//
-	SPI_connect();
 
 	/* stuff done only on the first call of the function */
 	if (SRF_IS_FIRSTCALL())
 	{
+		SPI_connect();
 		BeginTransactionBlock();
 		CommitTransactionCommand();
 		Relation	rel;
@@ -448,6 +448,7 @@ subscribe(PG_FUNCTION_ARGS)
 							PG_END_TRY();
 						}else{
 							logInfo("Subscriber not found!","RETURNING SRF_DONE");
+							SPI_finish();
 							SRF_RETURN_DONE(funcctx);
 						}
 					}

@@ -1,0 +1,14 @@
+#include<stdio.h>
+EXEC SQL INCLUDE sqlca;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char dbname[1024];
+EXEC SQL END DECLARE SECTION;
+
+int main (){
+    printf("Hello world!\n");
+    EXEC SQL CONNECT TO postgres@localhost as conn USER postgres;
+ EXEC SQL CREATE TABLE foo (number integer, ascii char(16));
+EXEC SQL CREATE UNIQUE INDEX num1 ON foo(number);
+EXEC SQL COMMIT;
+}
