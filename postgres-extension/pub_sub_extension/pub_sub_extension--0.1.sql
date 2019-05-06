@@ -15,6 +15,6 @@ CREATE FUNCTION publish(text,text,text) RETURNS text
 AS '$libdir/pub_sub_extension'
 LANGUAGE C IMMUTABLE STRICT;
 CREATE FUNCTION subscribe(text,text,text) 
-RETURNS setof subscribe_results
+RETURNS table (topic text, payload_timestamp text, payload text)
 AS '$libdir/pub_sub_extension'
 LANGUAGE C IMMUTABLE STRICT;
